@@ -1,0 +1,427 @@
+// ==UserScript==
+// @name         GeoFS AI ATC Assistant (Voice + Volume + T Toggle)
+// @namespace    tb-atc
+// @version      1.3.0
+// @description  GeoFS AI ATC，带语音、音量滑块，按 T 开关
+// @match        https://*.geo-fs.com/*
+// @match        https://geofs.com/*
+// @run-at       document-idle
+// @grant        none
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  const CFG = {
+    enabled: true,
+    mode: 'TWR',
+    atcCall: 'TB_TWR',
+    freq: '122.80',
+    rangeNM: 15,
+    trafficReport: true,
+    replyGap: 1200,
+    voiceOn: true,
+    voiceRate: 1.0,
+    voiceVoice: '',
+    voiceVol: 1.0
+  };
+
+  let lastReplyAt = 0;
+  let lastMsgText = '';
+  let panel = null;
+  let logBox = null;
+  let voiceList = [];
+
+  const $ = (s, r) => (r || document).querySelector(s);
+  const $$ = (s, r) => Array.from((r || document).querySelectorAll(s));
+  const G = () => window.geofs || (typeof globalThis !== 'undefined' && globalThis.geofs);
+
+  function speak(text) {
+    if (!CFG.voiceOn || !window.speechSynthesis) return;
+    window.speechSynthesis.cancel();
+    const utt = new SpeechSynthesisUtterance(text);
+    utt.rate = CFG.voiceRate;
+    utt.volume = CFG.voiceVol;
+    const v = voiceList.find(x => x.name === CFG.voiceVoice);
+    if (v) utt.voice = v;
+    utt.lang = 'en-US';
+    window.speechSynthesis.speak(utt);
+  }
+
+  function loadVoices() {
+    voiceList = window.speechSynthesis.getVoices();
+    const sel = $('#atc-voice');
+    if (!sel) return;
+    sel.innerHTML = '';
+    voiceList.forEach(v => {
+      const o = document.createElement('option');
+      o.value = v.name;
+      o.textContent = v.name + ' (' + v.lang + ')';
+      if (v.name === CFG.voiceVoice) o.selected = true;
+      sel.appendChild(o);
+    });
+  }
+
+  function haversineNM(a, b) {
+    const R = 3440.065;
+    const dLat = (b[0] - a[0]) * Math.PI / 180;
+    const dLon = (b[1] - a[1]) * Math.PI / 180;
+    const la1 = a[0] * Math.PI / 180;
+    const la2 = b[0] * Math.PI / 180;
+    const h = Math.sin(dLat / 2) ** 2 + Math.cos(la1) * Math.cos(la2) * Math.sin(dLon / 2) ** 2;
+    return 2 * R * Math.asin(Math.sqrt(h));
+  }
+
+  function bearing(from, to) {
+    const la1 = from[0] * Math.PI / 180;
+    const la2 = to[0] * Math.PI / 180;
+    const dLon = (to[1] - from[1]) * Math.PI / 180;
+    const y = Math.sin(dLon) * Math.cos(la2);
+    const x = Math.cos(la1) * Math.sin(la2) - Math.sin(la1) * Math.cos(la2) * Math.cos(dLon);
+    return (Math.atan2(y, x) * 180 / Math.PI + 360) % 360;
+  }
+
+  function hashStr(s) {
+    let h = 0;
+    for (let i = 0; i < String(s).length; i++) h = (h * 31 + String(s).charCodeAt(i)) | 0;
+    return Math.abs(h);
+  }
+
+  const pad3 = n => String(Math.round(n)).padStart(3, '0');
+  const ft = alt => Math.max(0, Math.round((alt || 0) * 3.28084));
+
+  function localPlane() {
+    const g = G();
+    const ac = g && g.aircraft && g.aircraft.instance;
+    if (!ac || !ac.llaLocation) return null;
+    return {
+      lla: ac.llaLocation,
+      heading: (ac.htr && ac.htr[0]) || 0,
+      ias: ac.trueAirSpeed || 0,
+      onGround: !!ac.groundContact,
+      callsign: (g.userRecord && g.userRecord.callsign) || 'LOCAL',
+    };
+  }
+
+  function listUsers() {
+    const g = G();
+    const m = g && g.multiplayer;
+    if (!m) return [];
+    let arr = [];
+    if (Array.isArray(m.users)) arr = m.users;
+    else if (m.users && typeof m.users === 'object') arr = Object.values(m.users);
+    else if (Array.isArray(m.aircrafts)) arr = m.aircrafts;
+    else if (m.aircrafts) arr = Object.values(m.aircrafts);
+    return arr.filter(u => u && (u.callsign || u.id)).map(u => {
+      let coord = null;
+      try { coord = typeof u.getCoordinates === 'function' ? u.getCoordinates() : (u.currentInterpolatedCoord || u.coords || null); } catch (e) { coord = null; }
+      return {
+        callsign: u.callsign || u.id || 'UNKNOWN',
+        aircraftName: u.aircraftName || '',
+        coord,
+        onGround: typeof u.isOnGround === 'function' ? u.isOnGround() : false,
+        raw: u,
+      };
+    }).filter(u => u.coord && u.coord.length >= 2);
+  }
+
+  function derivedRunway(local) {
+    const h = hashStr(local.lla[0].toFixed(4) + ',' + local.lla[1].toFixed(4));
+    return pad3(h % 360);
+  }
+  function derivedWind(local) {
+    const h = hashStr('wind' + local.lla[0].toFixed(3) + local.lla[1].toFixed(3));
+    return { dir: pad3(h % 360), spd: 5 + (h % 15) };
+  }
+
+  function log(text, cls) {
+    if (!logBox) return;
+    const d = document.createElement('div');
+    d.className = 'atc-log ' + (cls || 'sys');
+    const t = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+    d.textContent = `[${t}] ${text}`;
+    logBox.appendChild(d);
+    while (logBox.children.length > 60) logBox.removeChild(logBox.firstChild);
+    logBox.scrollTop = logBox.scrollHeight;
+  }
+
+  function classify(msg) {
+    const s = msg.toLowerCase();
+    if (/take[- ]?off|起飞|离场|departure|ready for dep/.test(s)) return 'takeoff';
+    if (/land|landing|降落|着陆|进近|approach|final|五边/.test(s)) return 'landing';
+    if (/hold|holding|等待|盘旋|等待航线/.test(s)) return 'holding';
+    if (/contact|移交|联系|切换|next freq/.test(s)) return 'contact';
+    if (/squawk|应答机|transponder/.test(s)) return 'squawk';
+    if (/hello|hi|你好|在场|值守|station|radio check|听得到|收到/.test(s)) return 'hello';
+    return 'unknown';
+  }
+
+  function extractCallsign(msg, users) {
+    const hit = users.find(u => msg.toLowerCase().includes(u.callsign.toLowerCase()));
+    if (hit) return hit.callsign;
+    const m = msg.trim().match(/^([A-Za-z0-9_\-]{2,12})\b/);
+    return m ? m[1].toUpperCase() : 'UNKNOWN';
+  }
+
+  function buildReply(call, kind, local) {
+    const rwy = derivedRunway(local);
+    const wind = derivedWind(local);
+    const altFt = ft(local.lla[2]);
+    switch (kind) {
+      case 'hello':
+        return `${call}, ${CFG.atcCall} ${CFG.freq}, radar contact, good day.`;
+      case 'takeoff':
+        return `${call}, wind ${wind.dir} at ${wind.spd}, runway ${rwy}, cleared for takeoff, fly runway heading, climb to 3000 ft.`;
+      case 'landing':
+        return `${call}, cleared visual approach runway ${rwy}, maintain ${Math.max(altFt, 1500)} ft until established, report final.`;
+      case 'holding':
+        return `${call}, hold east of the field, maintain ${Math.max(altFt, 2000)} ft, expect further clearance in 10 minutes.`;
+      case 'contact':
+        return `${call}, contact APP 124.35, good day.`;
+      case 'squawk':
+        return `${call}, squawk 4217.`;
+      default:
+        return `${call}, say again, unreadable, go ahead.`;
+    }
+  }
+
+  function findChatBoxes() {
+    const all = $$('textarea, input[type=text]').filter(el => !el.closest('#atc-panel') && el.offsetParent !== null);
+    const hit = all.filter(el => {
+      const ph = (el.placeholder || '').toLowerCase();
+      const al = (el.getAttribute('aria-label') || '').toLowerCase();
+      const cls = (el.className || '').toString().toLowerCase();
+      return /chat|radio|message|say|消息|聊天|通话/.test(ph + al + cls) || !!el.closest('.chat, #chat, .radio');
+    });
+    return hit.length ? hit : all;
+  }
+
+  function setNativeValue(el, val) {
+    const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    const setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
+    setter.call(el, val);
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+
+  function nativeSend(box, text) {
+    setNativeValue(box, text);
+    box.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
+    box.dispatchEvent(new KeyboardEvent('keypress', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
+    box.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
+    const form = box.closest('form');
+    if (form) form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+    const btn = box.parentElement && $('button[type=submit], .send-btn, [class*=send]', box.parentElement);
+    if (btn) btn.click();
+  }
+
+  function sendRadio(text) {
+    const g = G();
+    try {
+      if (g && g.chat && typeof g.chat.sendMessage === 'function') { g.chat.sendMessage(text); return 'api'; }
+      if (g && g.multiplayer && typeof g.multiplayer.sendMessage === 'function') { g.multiplayer.sendMessage(text); return 'api'; }
+    } catch (e) {}
+    const boxes = findChatBoxes();
+    if (boxes.length) { nativeSend(boxes[0], text); return 'box'; }
+    return 'panel';
+  }
+
+  function dispatchReply(msg) {
+    if (!CFG.enabled) return;
+    const now = Date.now();
+    if (now - lastReplyAt < CFG.replyGap) return;
+    const local = localPlane();
+    if (!local) { log('本机状态未就绪', 'sys'); return; }
+    const users = listUsers();
+    const call = extractCallsign(msg, users);
+    const kind = classify(msg);
+    const reply = buildReply(call, kind, local);
+    const via = sendRadio(reply);
+    speak(reply);
+    lastReplyAt = now;
+    log(`RX ${call}: ${msg}`, 'rx');
+    log(`TX ${CFG.atcCall}: ${reply}${via === 'panel' ? '（仅面板显示，未找到聊天框）' : ''}`, 'tx');
+  }
+
+  let boundBoxes = new Set();
+
+  function bindBox(box) {
+    if (boundBoxes.has(box)) return;
+    boundBoxes.add(box);
+    box.addEventListener('keydown', e => {
+      if (e.key === 'Enter' && box.value.trim()) {
+        const v = box.value.trim();
+        if (v !== lastMsgText) { lastMsgText = v; setTimeout(() => dispatchReply(v), 250); }
+      }
+    });
+  }
+
+  function pollChatDom() {
+    if (!CFG.enabled) return;
+    const sels = '.chat div, #chat div, .chat-messages div, #chatMessages div, .message, .chat-msg, .radio-msg';
+    const nodes = $$(sels).filter(n => n.children.length === 0 || /^(TX|RX|\[)/.test(n.textContent.trim()));
+    if (!nodes.length) return;
+    const last = nodes[nodes.length - 1].textContent.trim();
+    if (!last || last === lastMsgText) return;
+    if (panel && panel.contains(nodes[nodes.length - 1])) return;
+    lastMsgText = last;
+    dispatchReply(last);
+  }
+
+  function reportTraffic() {
+    if (!CFG.trafficReport || !CFG.enabled) return;
+    const local = localPlane();
+    if (!local) return;
+    const users = listUsers();
+    const nearby = users
+      .filter(u => u.callsign !== local.callsign)
+      .map(u => ({ u, nm: haversineNM(local.lla, u.coord), brg: bearing(local.lla, u.coord) }))
+      .filter(x => x.nm <= CFG.rangeNM)
+      .sort((a, b) => a.nm - b.nm)
+      .slice(0, 4);
+    if (!nearby.length) return;
+    const lines = nearby.map(x =>
+      `${x.u.callsign}, ${x.nm.toFixed(1)} NM ${pad3(x.brg)}, ${ft(x.u.coord[2])} ft, ${x.u.onGround ? 'ground' : 'airborne'}`
+    );
+    const msg = `${CFG.atcCall}: traffic ${lines.join('; ')}.`;
+    sendRadio(msg);
+    speak(msg);
+    log(`TX ${msg}`, 'tx');
+  }
+
+  function toggleATC() {
+    CFG.enabled = !CFG.enabled;
+    $('#atc-enable').checked = CFG.enabled;
+    log(CFG.enabled ? '[T] ATC 上线' : '[T] ATC 下线', 'sys');
+  }
+
+  function buildPanel() {
+    panel = document.createElement('div');
+    panel.id = 'atc-panel';
+    panel.innerHTML = `
+      <div class="atc-head">
+        <span class="atc-dot"></span>
+        <span class="atc-title">AI ATC + VOICE [T=切换]</span>
+        <label class="atc-sw"><input type="checkbox" id="atc-enable" ${CFG.enabled ? 'checked' : ''}> 启用</label>
+        <span class="atc-drag">⠿</span>
+      </div>
+      <div class="atc-body">
+        <div class="atc-row">
+          <label>模式
+            <select id="atc-mode">
+              <option value="TWR" ${CFG.mode === 'TWR' ? 'selected' : ''}>TWR 塔台</option>
+              <option value="APP" ${CFG.mode === 'APP' ? 'selected' : ''}>APP 进近</option>
+              <option value="CTR" ${CFG.mode === 'CTR' ? 'selected' : ''}>CTR 区调</option>
+            </select>
+          </label>
+          <label>呼号 <input id="atc-call" value="${CFG.atcCall}" size="8"></label>
+          <label>频率 <input id="atc-freq" value="${CFG.freq}" size="7"></label>
+        </div>
+        <div class="atc-row">
+          <label>雷达范围 <input id="atc-range" type="number" min="1" max="100" value="${CFG.rangeNM}"> NM</label>
+          <label class="atc-check"><input type="checkbox" id="atc-traffic" ${CFG.trafficReport ? 'checked' : ''}> 自动交通通报</label>
+        </div>
+        <div class="atc-row">
+          <label class="atc-check"><input type="checkbox" id="atc-voice-switch" ${CFG.voiceOn ? 'checked' : ''}> 语音</label>
+          <label>语速 <input id="atc-rate" type="number" min="0.5" max="1.8" step="0.1" value="${CFG.voiceRate}"></label>
+          <label>音量 <input id="atc-vol" type="range" min="0" max="1" step="0.05" value="${CFG.voiceVol}"></label>
+          <label>音色 <select id="atc-voice"></select></label>
+        </div>
+        <div class="atc-logbox" id="atc-log"></div>
+        <div class="atc-row">
+          <input id="atc-test" placeholder="模拟呼叫">
+          <button id="atc-send">发送</button>
+        </div>
+      </div>`;
+    document.body.appendChild(panel);
+    logBox = $('#atc-log', panel);
+
+    $('#atc-enable', panel).addEventListener('change', e => { CFG.enabled = e.target.checked; log(CFG.enabled ? 'ATC 上线' : 'ATC 下线', 'sys'); });
+    $('#atc-mode', panel).addEventListener('change', e => { CFG.mode = e.target.value; });
+    $('#atc-call', panel).addEventListener('input', e => { CFG.atcCall = e.target.value.trim() || 'ATC'; });
+    $('#atc-freq', panel).addEventListener('input', e => { CFG.freq = e.target.value.trim() || '122.80'; });
+    $('#atc-range', panel).addEventListener('input', e => { CFG.rangeNM = Math.max(1, Number(e.target.value) || 15); });
+    $('#atc-traffic', panel).addEventListener('change', e => { CFG.trafficReport = e.target.checked; });
+    $('#atc-voice-switch', panel).addEventListener('change', e => { CFG.voiceOn = e.target.checked; });
+    $('#atc-rate', panel).addEventListener('input', e => { CFG.voiceRate = +e.target.value; });
+    $('#atc-vol', panel).addEventListener('input', e => { CFG.voiceVol = +e.target.value; });
+    $('#atc-voice', panel).addEventListener('change', e => { CFG.voiceVoice = e.target.value; });
+
+    const test = $('#atc-test', panel);
+    const fire = () => { if (test.value.trim()) { dispatchReply(test.value.trim()); test.value = ''; } };
+    $('#atc-send', panel).addEventListener('click', fire);
+    test.addEventListener('keydown', e => { if (e.key === 'Enter') fire(); });
+
+    const head = $('.atc-head', panel);
+    let sx = 0, sy = 0, ox = 0, oy = 0, drag = false;
+    head.addEventListener('mousedown', e => {
+      if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
+      drag = true; sx = e.clientX; sy = e.clientY;
+      const r = panel.getBoundingClientRect(); ox = r.left; oy = r.top;
+      panel.style.right = 'auto';
+    });
+    document.addEventListener('mousemove', e => {
+      if (!drag) return;
+      panel.style.left = (ox + e.clientX - sx) + 'px';
+      panel.style.top = (oy + e.clientY - sy) + 'px';
+    });
+    document.addEventListener('mouseup', () => { drag = false; });
+  }
+
+  function injectStyle() {
+    const st = document.createElement('style');
+    st.textContent = `
+      #atc-panel{position:fixed;top:80px;right:16px;width:400px;background:rgba(15,20,28,.92);color:#e8eef5;
+        font:12px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;border:1px solid #2c3947;border-radius:10px;
+        z-index:99999;box-shadow:0 8px 24px rgba(0,0,0,.4);overflow:hidden}
+      #atc-panel .atc-head{display:flex;align-items:center;gap:8px;padding:8px 10px;background:#1b2632;cursor:move}
+      #atc-panel .atc-dot{width:9px;height:9px;border-radius:50%;background:#35d07f;box-shadow:0 0 8px #35d07f}
+      #atc-panel .atc-title{font-weight:700;letter-spacing:.5px}
+      #atc-panel .atc-sw{margin-left:auto;display:flex;align-items:center;gap:4px}
+      #atc-panel .atc-drag{opacity:.5}
+      #atc-panel .atc-body{padding:10px;display:flex;flex-direction:column;gap:8px}
+      #atc-panel .atc-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+      #atc-panel label{display:flex;align-items:center;gap:4px}
+      #atc-panel select,#atc-panel input{background:#0e141b;color:#e8eef5;border:1px solid #2c3947;border-radius:5px;padding:3px 6px}
+      #atc-panel input[type="range"]{width:90px}
+      #atc-panel button{background:#2f6fed;color:#fff;border:0;border-radius:5px;padding:4px 10px;cursor:pointer}
+      #atc-panel .atc-logbox{height:140px;overflow-y:auto;background:#0b1016;border:1px solid #22303d;border-radius:6px;padding:6px}
+      #atc-panel .atc-log{margin-bottom:3px;word-break:break-word}
+      #atc-panel .atc-log.tx{color:#7fd4ff}
+      #atc-panel .atc-log.rx{color:#c9d3dd}
+      #atc-panel .atc-log.sys{color:#e6c76a}
+      #atc-panel ::-webkit-scrollbar{width:6px}
+      #atc-panel ::-webkit-scrollbar-thumb{background:#2c3947;border-radius:3px}`;
+    document.head.appendChild(st);
+  }
+
+  function waitForGeoFS(cb, tries) {
+    tries = tries || 0;
+    if (G() && G().aircraft && G().aircraft.instance) return cb();
+    if (tries > 60) { log('未检测 GeoFS', 'sys'); return; }
+    setTimeout(() => waitForGeoFS(cb, tries + 1), 500);
+  }
+
+  function start() {
+    injectStyle();
+    buildPanel();
+    log('AI ATC VOICE + VOLUME + T Toggle 已加载，按 T 切换', 'sys');
+    if (window.speechSynthesis) {
+      loadVoices();
+      window.speechSynthesis.onvoiceschanged = loadVoices;
+    }
+    document.addEventListener('keydown',e=>{
+      if(e.key.toLowerCase()==='t'&&!['INPUT','TEXTAREA'].includes(document.activeElement.tagName)){
+        e.preventDefault();
+        toggleATC();
+      }
+    });
+    setInterval(() => { findChatBoxes().forEach(bindBox); }, 2000);
+    setInterval(pollChatDom, 2500);
+    setInterval(() => { if (CFG.enabled) reportTraffic(); }, 15000);
+    waitForGeoFS(() => log(`GeoFS 连接，本机呼号 ${localPlane().callsign}`, 'sys'));
+  }
+
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start);
+  else start();
+})();
